@@ -311,7 +311,7 @@ impl Dumper {
         progress.stage = ProgressStage::BuildingOutput;
         report(&progress);
 
-        let (mut output, section_mappings) = self.build_output_pe(
+        let (mut output, section_mappings, aligned_headers) = self.build_output_pe(
             pe,
             &stub_generator,
             &heap_ptr_locs,
@@ -330,8 +330,9 @@ impl Dumper {
                 &stub_generator,
                 &heap_ptr_locs,
                 &section_mappings,
+                aligned_headers,
                 config,
-            )?;
+            )?;;
 
             eprintln!(
                 "Devirt: {} vcalls found, {} resolved, {} patched",
@@ -438,33 +439,61 @@ impl Dumper {
 
         Ok(results)
     }
+}
 
-    /// Build the output PE with heap section.
-    /// Returns the output buffer and section mappings for devirt.
-    fn build_output_pe(
-        &self,
-        pe: &PeParser,
-        stub_generator: &StubGenerator,
-        heap_ptr_locs: &[ScanResult],
-        heap_section_va: u32,
-        heap_section_size: usize,
-    ) -> Result<(Vec<u8>, Vec<SectionMapping>)> {
-        // Calculate sizes
-        let num_sections = pe.sections.len() + 1; // +1 for .heap
+// =============================================================================
+// PeBuilder — shared PE output construction logic
+// =============================================================================
+
+/// Collects per-section data and computes the raw file layout for a PE output.
+///
+/// Both `build_output_pe` (heap mode) and `standard_dump` share the same steps:
+/// - calculating `aligned_headers`
+/// - iterating sections and assigning `new_pointer_to_raw_data` / `new_size_of_raw_data`
+/// - writing the DOS area, PE signature, FileHeader, optional header,
+///   section headers, and section body data into the output buffer.
+///
+/// `PeBuilder` extracts all of that logic into one place.
+struct PeBuilder<'a> {
+    /// Reference to the dumper (for `base` address and `dump_section`).
+    dumper: &'a Dumper,
+    /// Parsed PE metadata.
+    pe: &'a PeParser,
+    /// Aligned size of the headers area (file offset of first section raw data).
+    pub aligned_headers: usize,
+    /// Sections with updated `new_pointer_to_raw_data` / `new_size_of_raw_data`.
+    pub sections_info: Vec<SectionInfo>,
+    /// Padded raw body bytes for each section (parallel to `sections_info`).
+    section_data: Vec<Vec<u8>>,
+    /// Total number of section header slots (original + any extras reserved by the caller).
+    pub num_sections: usize,
+    /// Current raw file offset after all original section data.
+    /// Callers may advance this to reserve space for additional sections.
+    pub current_raw_offset: usize,
+}
+
+impl<'a> PeBuilder<'a> {
+    /// Create a builder.
+    ///
+    /// `extra_section_headers` — number of *additional* section header slots to
+    /// reserve in the header size calculation (e.g. 1 for `.heap`).
+    fn new(dumper: &'a Dumper, pe: &'a PeParser, extra_section_headers: usize) -> Self {
+        let num_sections = pe.sections.len() + extra_section_headers;
+
         let headers_size = pe.pe_offset as usize
-            + 4  // PE signature
+            + 4 // PE signature
             + std::mem::size_of::<FileHeader>()
             + pe.size_of_optional_header as usize
             + num_sections * std::mem::size_of::<SectionHeader>();
         let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
 
-        // Dump original sections and compute their new offsets
-        let mut section_data: Vec<Vec<u8>> = Vec::with_capacity(pe.sections.len());
+        // Collect and align section body data.
         let mut sections_info: Vec<SectionInfo> = pe.sections.clone();
+        let mut section_data: Vec<Vec<u8>> = Vec::with_capacity(pe.sections.len());
         let mut current_raw_offset = aligned_headers;
 
         for (i, section) in sections_info.iter_mut().enumerate() {
-            let data = self.dump_section(&pe.sections[i]);
+            let data = dumper.dump_section(&pe.sections[i]);
             let raw_size = PeParser::align_up(data.len(), pe.file_alignment as usize);
 
             section.new_pointer_to_raw_data = if data.is_empty() {
@@ -484,36 +513,50 @@ impl Dumper {
             }
         }
 
-        // Build heap section data (minimal stubs)
-        let heap_data = stub_generator.build_section_data(heap_section_size, pe.file_alignment);
-        let heap_raw_size = PeParser::align_up(heap_data.len(), pe.file_alignment as usize);
-        let heap_raw_offset = current_raw_offset as u32;
-        current_raw_offset += heap_raw_size;
+        Self {
+            dumper,
+            pe,
+            aligned_headers,
+            sections_info,
+            section_data,
+            num_sections,
+            current_raw_offset,
+        }
+    }
 
-        // Calculate total output size
-        let total_size = current_raw_offset;
-        let mut output = vec![0u8; total_size];
+    /// Write all common PE headers into `output` and return the byte position
+    /// immediately after the last original section header (where extra headers
+    /// such as `.heap` can be appended by the caller).
+    ///
+    /// `num_sections_in_header` — the value written into `FileHeader::number_of_sections`.
+    /// `new_size_of_image` — if `Some`, patches `SizeOfImage` in the optional header.
+    fn write_common_headers(
+        &self,
+        output: &mut Vec<u8>,
+        num_sections_in_header: u16,
+        new_size_of_image: Option<u32>,
+    ) -> usize {
+        let pe = self.pe;
 
-        // Copy entire original DOS header area (includes DOS header, stub, and Rich header)
-        // This preserves all metadata up to the PE signature
+        // Copy DOS header + stub + Rich header up to the PE signature.
         let dos_area_size = pe.pe_offset as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.base,
+                self.dumper.base,
                 output.as_mut_ptr(),
                 dos_area_size,
             );
         }
 
-        // Write PE signature
+        // PE signature.
         let mut pos = pe.pe_offset as usize;
         output[pos..pos + 4].copy_from_slice(&PE_SIGNATURE.to_le_bytes());
         pos += 4;
 
-        // Write file header
+        // FileHeader.
         let file_header = FileHeader {
             machine: pe.machine,
-            number_of_sections: num_sections as u16,
+            number_of_sections: num_sections_in_header,
             time_date_stamp: pe.time_date_stamp,
             pointer_to_symbol_table: 0,
             number_of_symbols: 0,
@@ -529,29 +572,26 @@ impl Dumper {
         }
         pos += std::mem::size_of::<FileHeader>();
 
-        // Write optional header (copy original and update sizes)
-        let new_size_of_image = PeParser::align_up(
-            (heap_section_va + heap_section_size as u32) as usize,
-            pe.section_alignment as usize,
-        ) as u32;
-
+        // Optional header — copy verbatim, then optionally patch SizeOfImage / SizeOfHeaders.
         output[pos..pos + pe.optional_header_raw.len()]
             .copy_from_slice(&pe.optional_header_raw);
-
-        // Update SizeOfImage and SizeOfHeaders in optional header
-        if pe.is_64bit {
-            let opt = unsafe { &mut *(output.as_mut_ptr().add(pos) as *mut OptionalHeader64) };
-            opt.size_of_image = new_size_of_image;
-            opt.size_of_headers = aligned_headers as u32;
-        } else {
-            let opt = unsafe { &mut *(output.as_mut_ptr().add(pos) as *mut OptionalHeader32) };
-            opt.size_of_image = new_size_of_image;
-            opt.size_of_headers = aligned_headers as u32;
+        if let Some(size_of_image) = new_size_of_image {
+            if pe.is_64bit {
+                let opt =
+                    unsafe { &mut *(output.as_mut_ptr().add(pos) as *mut OptionalHeader64) };
+                opt.size_of_image = size_of_image;
+                opt.size_of_headers = self.aligned_headers as u32;
+            } else {
+                let opt =
+                    unsafe { &mut *(output.as_mut_ptr().add(pos) as *mut OptionalHeader32) };
+                opt.size_of_image = size_of_image;
+                opt.size_of_headers = self.aligned_headers as u32;
+            }
         }
         pos += pe.size_of_optional_header as usize;
 
-        // Write section headers
-        for section in sections_info.iter() {
+        // Section headers for original sections.
+        for section in &self.sections_info {
             let header = SectionHeader {
                 name: {
                     let mut name = [0u8; 8];
@@ -580,7 +620,78 @@ impl Dumper {
             pos += std::mem::size_of::<SectionHeader>();
         }
 
-        // Write .heap section header
+        pos
+    }
+
+    /// Write raw section body data into the output buffer at their assigned file offsets.
+    fn write_section_data(&self, output: &mut Vec<u8>) {
+        for (i, section) in self.sections_info.iter().enumerate() {
+            if section.new_pointer_to_raw_data > 0 && !self.section_data[i].is_empty() {
+                let offset = section.new_pointer_to_raw_data as usize;
+                output[offset..offset + self.section_data[i].len()]
+                    .copy_from_slice(&self.section_data[i]);
+            }
+        }
+    }
+
+    /// Build `SectionMapping`s for the original sections.
+    fn section_mappings(&self) -> Vec<SectionMapping> {
+        self.sections_info
+            .iter()
+            .map(|s| {
+                SectionMapping::new(
+                    s.virtual_address,
+                    s.virtual_size,
+                    s.new_size_of_raw_data,
+                    s.new_pointer_to_raw_data,
+                )
+            })
+            .collect()
+    }
+}
+
+impl Dumper {
+    /// Build the output PE with heap section.
+    /// Returns the output buffer, section mappings, and aligned_headers for devirt.
+    fn build_output_pe(
+        &self,
+        pe: &PeParser,
+        stub_generator: &StubGenerator,
+        heap_ptr_locs: &[ScanResult],
+        heap_section_va: u32,
+        heap_section_size: usize,
+    ) -> Result<(Vec<u8>, Vec<SectionMapping>, usize)> {
+        // Build heap section data and compute its raw layout before the builder
+        // so we know the extra section count for the header size calculation.
+        let heap_data = stub_generator.build_section_data(heap_section_size, pe.file_alignment);
+        let heap_raw_size = PeParser::align_up(heap_data.len(), pe.file_alignment as usize);
+
+        // PeBuilder handles all common header/section writing (+1 extra section slot for .heap).
+        let extra_section_headers = 1usize;
+        let mut builder = PeBuilder::new(self, pe, extra_section_headers);
+
+        // The .heap is appended after the builder's tracked raw data.
+        let heap_raw_offset = builder.current_raw_offset as u32;
+        builder.current_raw_offset += heap_raw_size;
+
+        // Allocate output buffer (builder size + heap raw data).
+        let total_size = builder.current_raw_offset;
+        let mut output = vec![0u8; total_size];
+
+        // Compute the updated SizeOfImage to include the .heap section.
+        let new_size_of_image = Some(PeParser::align_up(
+            (heap_section_va + heap_section_size as u32) as usize,
+            pe.section_alignment as usize,
+        ) as u32);
+
+        // Write DOS area, PE sig, FileHeader, optional header, original section headers, data.
+        let mut pos = builder.write_common_headers(
+            &mut output,
+            builder.num_sections as u16,
+            new_size_of_image,
+        );
+
+        // Write the .heap section header after the original ones.
         let heap_header = SectionHeader {
             name: *b".heap\0\0\0",
             virtual_size: heap_section_size as u32,
@@ -600,17 +711,13 @@ impl Dumper {
                 std::mem::size_of::<SectionHeader>(),
             );
         }
+        // pos is not used after this; section data is written by file offset, not pos.
+        let _ = pos;
 
-        // Write section data
-        for (i, section) in sections_info.iter().enumerate() {
-            if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
-                let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()]
-                    .copy_from_slice(&section_data[i]);
-            }
-        }
+        // Write section body data.
+        builder.write_section_data(&mut output);
 
-        // Write heap section data (vtable stubs)
+        // Write .heap body data.
         {
             let offset = heap_raw_offset as usize;
             let mut padded_heap = heap_data;
@@ -618,36 +725,25 @@ impl Dumper {
             output[offset..offset + padded_heap.len()].copy_from_slice(&padded_heap);
         }
 
-        // Generate and apply fixups
+        // Build section mappings (original sections only; .heap fixups don't need a mapping).
+        let section_mappings = builder.section_mappings();
+
+        // Generate and apply fixups.
         let (fixups, _stats) = generate_fixups(heap_ptr_locs, stub_generator, pe.image_base);
-
-        let section_mappings: Vec<SectionMapping> = sections_info
-            .iter()
-            .map(|s| {
-                SectionMapping::new(
-                    s.virtual_address,
-                    s.virtual_size,
-                    s.new_size_of_raw_data,
-                    s.new_pointer_to_raw_data,
-                )
-            })
-            .collect();
-
-        let first_section_rva = sections_info
+        let first_section_rva = builder.sections_info
             .iter()
             .map(|s| s.virtual_address)
             .min()
             .unwrap_or(0);
-
         let (_applied, _skipped) = apply_fixups(
             &mut output,
             &fixups,
             &section_mappings,
             first_section_rva,
-            aligned_headers,
+            builder.aligned_headers,
         );
 
-        Ok((output, section_mappings))
+        Ok((output, section_mappings, builder.aligned_headers))
     }
 
     /// Dump a section's data from memory.
@@ -701,21 +797,13 @@ impl Dumper {
         stub_generator: &StubGenerator,
         heap_ptr_locs: &[ScanResult],
         section_mappings: &[SectionMapping],
+        aligned_headers: usize,
         config: &DumpConfig,
     ) -> Result<DevirtStats> {
         // Find .text section (or first code section)
         let text_section = pe.sections.iter()
             .find(|s| s.name == ".text" || (s.characteristics & 0x20) != 0) // IMAGE_SCN_CNT_CODE
             .ok_or_else(|| Error::SectionNotFound { name: ".text".to_string() })?;
-
-        // Calculate headers size for protection
-        let num_sections = pe.sections.len() + 1; // +1 for .heap
-        let headers_size = pe.pe_offset as usize
-            + 4  // PE signature
-            + std::mem::size_of::<FileHeader>()
-            + pe.size_of_optional_header as usize
-            + num_sections * std::mem::size_of::<SectionHeader>();
-        let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
 
         // Call devirtualization
         devirt::devirtualize(
@@ -726,7 +814,7 @@ impl Dumper {
             text_section.virtual_size,
             heap_ptr_locs,
             stub_generator,
-            &section_mappings,
+            section_mappings,
             aligned_headers,
             &config.devirt_config,
         )
@@ -741,120 +829,17 @@ impl Dumper {
         self.parse()?;
         let pe = self.pe.as_ref().unwrap();
 
-        // Calculate sizes
-        let headers_size = pe.pe_offset as usize
-            + 4
-            + std::mem::size_of::<FileHeader>()
-            + pe.size_of_optional_header as usize
-            + pe.sections.len() * std::mem::size_of::<SectionHeader>();
-        let aligned_headers = PeParser::align_up(headers_size, pe.file_alignment as usize);
-
-        // Dump sections
-        let mut section_data: Vec<Vec<u8>> = Vec::with_capacity(pe.sections.len());
-        let mut sections_info: Vec<SectionInfo> = pe.sections.clone();
-        let mut current_raw_offset = aligned_headers;
-
-        for (i, section) in sections_info.iter_mut().enumerate() {
-            let data = self.dump_section(&pe.sections[i]);
-            let raw_size = PeParser::align_up(data.len(), pe.file_alignment as usize);
-
-            section.new_pointer_to_raw_data = if data.is_empty() {
-                0
-            } else {
-                current_raw_offset as u32
-            };
-            section.new_size_of_raw_data = raw_size as u32;
-
-            if !data.is_empty() {
-                let mut padded = data;
-                padded.resize(raw_size, 0);
-                section_data.push(padded);
-                current_raw_offset += raw_size;
-            } else {
-                section_data.push(Vec::new());
-            }
-        }
-
-        let total_size = current_raw_offset;
+        let builder = PeBuilder::new(self, pe, 0);
+        let total_size = builder.current_raw_offset;
         let mut output = vec![0u8; total_size];
 
-        // Copy entire original DOS header area (includes DOS header, stub, and Rich header)
-        let dos_area_size = pe.pe_offset as usize;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.base,
-                output.as_mut_ptr(),
-                dos_area_size,
-            );
-        }
-
-        // PE signature
-        let mut pos = pe.pe_offset as usize;
-        output[pos..pos + 4].copy_from_slice(&PE_SIGNATURE.to_le_bytes());
-        pos += 4;
-
-        // File header
-        let file_header = FileHeader {
-            machine: pe.machine,
-            number_of_sections: pe.sections.len() as u16,
-            time_date_stamp: pe.time_date_stamp,
-            pointer_to_symbol_table: 0,
-            number_of_symbols: 0,
-            size_of_optional_header: pe.size_of_optional_header,
-            characteristics: pe.characteristics,
-        };
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                &file_header as *const _ as *const u8,
-                output.as_mut_ptr().add(pos),
-                std::mem::size_of::<FileHeader>(),
-            );
-        }
-        pos += std::mem::size_of::<FileHeader>();
-
-        // Optional header
-        output[pos..pos + pe.optional_header_raw.len()]
-            .copy_from_slice(&pe.optional_header_raw);
-        pos += pe.size_of_optional_header as usize;
-
-        // Section headers
-        for section in &sections_info {
-            let header = SectionHeader {
-                name: {
-                    let mut name = [0u8; 8];
-                    let bytes = section.name.as_bytes();
-                    let len = bytes.len().min(8);
-                    name[..len].copy_from_slice(&bytes[..len]);
-                    name
-                },
-                virtual_size: section.virtual_size,
-                virtual_address: section.virtual_address,
-                size_of_raw_data: section.new_size_of_raw_data,
-                pointer_to_raw_data: section.new_pointer_to_raw_data,
-                pointer_to_relocations: 0,
-                pointer_to_linenumbers: 0,
-                number_of_relocations: 0,
-                number_of_linenumbers: 0,
-                characteristics: section.characteristics,
-            };
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &header as *const _ as *const u8,
-                    output.as_mut_ptr().add(pos),
-                    std::mem::size_of::<SectionHeader>(),
-                );
-            }
-            pos += std::mem::size_of::<SectionHeader>();
-        }
-
-        // Section data
-        for (i, section) in sections_info.iter().enumerate() {
-            if section.new_pointer_to_raw_data > 0 && !section_data[i].is_empty() {
-                let offset = section.new_pointer_to_raw_data as usize;
-                output[offset..offset + section_data[i].len()]
-                    .copy_from_slice(&section_data[i]);
-            }
-        }
+        // Write all common headers and section data.
+        let _pos = builder.write_common_headers(
+            &mut output,
+            pe.sections.len() as u16,
+            None, // SizeOfImage unchanged for standard dump
+        );
+        builder.write_section_data(&mut output);
 
         self.write_output(output_path, &output)
     }
