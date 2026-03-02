@@ -107,9 +107,12 @@ impl PointerScanner {
         results: &mut Vec<ScanResult>,
     ) {
         let num_qwords = buffer.len() / 8;
-        // SAFETY: We're reinterpreting bytes as u64s, which is safe for aligned data
-        let qwords = unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr() as *const u64, num_qwords)
+        let base_ptr = buffer.as_ptr();
+
+        // Helper: read a u64 at qword index `idx` without requiring alignment.
+        // SAFETY: `idx * 8 + 8 <= buffer.len()` is guaranteed by `num_qwords`.
+        let read_qword = |idx: usize| -> u64 {
+            unsafe { std::ptr::read_unaligned(base_ptr.add(idx * 8) as *const u64) }
         };
 
         let min_ptr = self.config.min_ptr;
@@ -123,7 +126,7 @@ impl PointerScanner {
             // Prefetch ahead
             if i + 32 < num_qwords {
                 unsafe {
-                    let prefetch_ptr = qwords.as_ptr().add(i + 32);
+                    let prefetch_ptr = base_ptr.add((i + 32) * 8);
                     #[cfg(target_arch = "x86_64")]
                     {
                         use std::arch::x86_64::_mm_prefetch;
@@ -134,7 +137,7 @@ impl PointerScanner {
 
             // Unrolled loop
             for j in 0..4 {
-                let val = qwords[i + j];
+                let val = read_qword(i + j);
                 if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                     && cache.is_valid_heap_region(val)
                 {
@@ -147,7 +150,7 @@ impl PointerScanner {
 
         // Handle remaining elements
         while i < num_qwords {
-            let val = qwords[i];
+            let val = read_qword(i);
             if Self::is_candidate(val, min_ptr, max_ptr, mod_base, mod_end)
                 && cache.is_valid_heap_region(val)
             {
