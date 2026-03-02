@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::fixup::{apply_fixups, generate_fixups, SectionMapping};
 use crate::stub::{StubConfig, StubGenerator};
-use crate::memory::is_memory_readable;
+use crate::memory::{is_memory_readable, MemoryRegionCache};
 use crate::pe::{
     FileHeader, OptionalHeader32, OptionalHeader64, PeParser, SectionHeader,
     SectionInfo, HEAP_SECTION_CHARACTERISTICS, PE_SIGNATURE,
@@ -270,14 +270,18 @@ impl Dumper {
         self.parse()?;
         let pe = self.pe.as_ref().unwrap();
 
-        // Create stub generator
+        // Build memory region cache once — shared by both the stub generator
+        // and the section scanner so VirtualQuery is enumerated only once.
         progress.stage = ProgressStage::BuildingCache;
         report(&progress);
-        let mut stub_generator = StubGenerator::new(
+        let shared_cache = MemoryRegionCache::build_shared()?;
+
+        let mut stub_generator = StubGenerator::new_with_cache(
             self.base,
             self.size,
             config.to_stub_config(),
-        )?;
+            shared_cache,
+        );
 
         // Scan sections for heap pointers
         let heap_ptr_locs = self.scan_sections(pe, config, &stub_generator, &mut progress, &report)?;
@@ -332,7 +336,7 @@ impl Dumper {
                 &section_mappings,
                 aligned_headers,
                 config,
-            )?;;
+            )?;
 
             eprintln!(
                 "Devirt: {} vcalls found, {} resolved, {} patched",
@@ -415,7 +419,7 @@ impl Dumper {
                     let buffer = unsafe { std::slice::from_raw_parts(chunk_ptr, read_size) };
                     let base_rva = section.virtual_address + chunk_off as u32;
 
-                    let chunk_results = scanner.scan_buffer(buffer, base_rva, cache);
+                    let chunk_results = scanner.scan_buffer(buffer, base_rva, &cache);
                     results.extend(chunk_results);
                 }
 

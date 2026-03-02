@@ -30,6 +30,7 @@ use crate::scanner::ScannerConfig;
 use crate::error::Result;
 
 use std::collections::{HashMap, HashSet, BTreeSet};
+use std::sync::Arc;
 
 /// Statistics for stub creation debugging.
 #[derive(Default)]
@@ -101,8 +102,9 @@ pub struct StubGenerator {
     mod_end: u64,
     /// Configuration.
     config: StubConfig,
-    /// Memory region cache.
-    region_cache: MemoryRegionCache,
+    /// Memory region cache — shared with the scanner via `Arc` to avoid
+    /// duplicate `VirtualQuery` enumeration.
+    region_cache: Arc<MemoryRegionCache>,
     /// Generated stubs, keyed by original heap address.
     stubs: HashMap<u64, VtableStub>,
     /// Visited addresses to avoid cycles.
@@ -110,21 +112,37 @@ pub struct StubGenerator {
 }
 
 impl StubGenerator {
-    /// Create a new stub generator.
+    /// Create a new stub generator, building the memory region cache internally.
+    ///
+    /// Prefer [`StubGenerator::new_with_cache`] when you also need the cache
+    /// for other components (e.g. the pointer scanner), so the `VirtualQuery`
+    /// enumeration is only performed once.
+    #[cfg(target_os = "windows")]
     pub fn new(mod_base: *const u8, mod_size: usize, config: StubConfig) -> Result<Self> {
+        let cache = MemoryRegionCache::build_shared()?;
+        Ok(Self::new_with_cache(mod_base, mod_size, config, cache))
+    }
+
+    /// Create a stub generator that shares an already-built `MemoryRegionCache`.
+    ///
+    /// The caller is responsible for building the cache (via
+    /// [`MemoryRegionCache::build_shared`]) and may pass the same `Arc` to other
+    /// components such as the pointer scanner.
+    pub fn new_with_cache(
+        mod_base: *const u8,
+        mod_size: usize,
+        config: StubConfig,
+        cache: Arc<MemoryRegionCache>,
+    ) -> Self {
         let mod_base_num = mod_base as u64;
-
-        let mut region_cache = MemoryRegionCache::new();
-        region_cache.build()?;
-
-        Ok(Self {
+        Self {
             mod_base: mod_base_num,
             mod_end: mod_base_num + mod_size as u64,
             config,
-            region_cache,
+            region_cache: cache,
             stubs: HashMap::with_capacity(8192),
             visited: HashSet::with_capacity(16384),
-        })
+        }
     }
 
     /// Check if an address is within the module (potential vtable).
@@ -498,9 +516,13 @@ impl StubGenerator {
         }
     }
 
-    /// Get memory cache reference.
-    pub fn cache(&self) -> &MemoryRegionCache {
-        &self.region_cache
+    /// Get a clone of the shared memory cache `Arc`.
+    ///
+    /// Cloning an `Arc` is cheap (atomic reference count increment) and allows
+    /// other components such as the pointer scanner to share the same underlying
+    /// cache without duplicating the `VirtualQuery` enumeration.
+    pub fn cache(&self) -> Arc<MemoryRegionCache> {
+        Arc::clone(&self.region_cache)
     }
 }
 

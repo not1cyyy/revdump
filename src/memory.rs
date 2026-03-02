@@ -5,6 +5,8 @@
 
 use crate::error::Result;
 
+use std::sync::Arc;
+
 #[cfg(target_os = "windows")]
 use std::ptr::null_mut;
 
@@ -53,6 +55,18 @@ impl MemoryRegionCache {
             regions: Vec::new(),
             initialized: false,
         }
+    }
+
+    /// Build the cache and return it wrapped in an `Arc` for shared ownership.
+    ///
+    /// Use this when the same cache needs to be shared between multiple components
+    /// (e.g. `StubGenerator` and the pointer scanner) to avoid duplicate
+    /// `VirtualQuery` enumeration.
+    #[cfg(target_os = "windows")]
+    pub fn build_shared() -> Result<Arc<Self>> {
+        let mut cache = Self::new();
+        cache.build()?;
+        Ok(Arc::new(cache))
     }
 
     /// Build the cache by enumerating all memory regions.
