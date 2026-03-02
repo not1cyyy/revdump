@@ -434,7 +434,13 @@ impl ConsoleState {
             let new_module = input.trim();
             if !new_module.is_empty() {
                 // Verify module exists
-                let name_cstr = std::ffi::CString::new(new_module).unwrap();
+                let name_cstr = match std::ffi::CString::new(new_module) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        println!("[ERROR] Module name contains invalid characters (null bytes).");
+                        return;
+                    }
+                };
                 let result = unsafe {
                     GetModuleHandleA(PCSTR(name_cstr.as_ptr() as *const u8))
                 };
