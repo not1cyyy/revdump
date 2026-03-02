@@ -173,6 +173,12 @@ impl DumpConfig {
 /// Main PE dumper.
 pub struct Dumper {
     /// Module base address.
+    ///
+    /// # Safety contract
+    /// This pointer is derived from a Windows `HMODULE` or a caller-supplied raw address and
+    /// is valid for reads of at least `size` bytes for as long as the `Dumper` exists.
+    /// The caller must ensure the underlying module is not unloaded for the lifetime of this
+    /// struct.
     base: *const u8,
     /// Module size.
     size: usize,
@@ -182,11 +188,18 @@ pub struct Dumper {
     pe: Option<PeParser>,
 }
 
+// SAFETY: `base` points into a Windows module image that remains valid and immutable
+// for the lifetime of the Dumper. Windows module memory is globally accessible within the
+// process address space, so sharing the pointer across threads is safe.
+unsafe impl Send for Dumper {}
+unsafe impl Sync for Dumper {}
+
 impl Dumper {
     /// Create a dumper for a module by name.
     #[cfg(target_os = "windows")]
     pub fn from_module_name(name: &str) -> Result<Self> {
-        let name_cstr = std::ffi::CString::new(name).unwrap();
+        let name_cstr = std::ffi::CString::new(name)
+            .map_err(|_| Error::ModuleNotFound(name.to_string()))?;
         let hmodule = unsafe { GetModuleHandleA(PCSTR(name_cstr.as_ptr() as *const u8)) }?;
 
         if hmodule.is_invalid() {
