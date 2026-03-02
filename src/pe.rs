@@ -299,8 +299,9 @@ impl PeParser {
             });
         }
 
-        // Read DOS header
-        let dos_header = &*(base as *const DosHeader);
+        // Read DOS header using read_unaligned to avoid UB on packed struct references.
+        // SAFETY: size check above guarantees at least size_of::<DosHeader>() bytes are valid.
+        let dos_header: DosHeader = std::ptr::read_unaligned(base as *const DosHeader);
         if dos_header.e_magic != DOS_MAGIC {
             return Err(Error::InvalidDosSignature(0));
         }
@@ -317,14 +318,17 @@ impl PeParser {
             });
         }
 
-        // Read PE signature
-        let pe_sig = *(base.add(pe_header_start) as *const u32);
+        // Read PE signature (u32 may not be aligned, use read_unaligned).
+        // SAFETY: min_pe_size check above guarantees these bytes are valid.
+        let pe_sig: u32 = std::ptr::read_unaligned(base.add(pe_header_start) as *const u32);
         if pe_sig != PE_SIGNATURE {
             return Err(Error::InvalidPeSignature(pe_header_start));
         }
 
-        // Read file header
-        let file_header = &*(base.add(pe_header_start + 4) as *const FileHeader);
+        // Read file header — use read_unaligned for the packed struct.
+        // SAFETY: min_pe_size check guarantees size_of::<FileHeader>() bytes are valid here.
+        let file_header: FileHeader =
+            std::ptr::read_unaligned(base.add(pe_header_start + 4) as *const FileHeader);
         let machine = file_header.machine;
         let is_64bit = machine == MACHINE_AMD64;
 
@@ -335,10 +339,13 @@ impl PeParser {
         let opt_header_start = pe_header_start + 4 + std::mem::size_of::<FileHeader>();
         let size_of_optional_header = file_header.size_of_optional_header;
 
-        // Parse optional header for key fields
+        // Parse optional header for key fields using read_unaligned for packed structs.
+        // SAFETY: the header sizes are already validated implicitly by SizeOfImage; the
+        //         optional header must be present for the PE to be valid.
         let (image_base, section_alignment, file_alignment, size_of_image, size_of_headers) =
             if is_64bit {
-                let opt = &*(base.add(opt_header_start) as *const OptionalHeader64);
+                let opt: OptionalHeader64 =
+                    std::ptr::read_unaligned(base.add(opt_header_start) as *const OptionalHeader64);
                 (
                     opt.image_base,
                     opt.section_alignment,
@@ -347,7 +354,8 @@ impl PeParser {
                     opt.size_of_headers,
                 )
             } else {
-                let opt = &*(base.add(opt_header_start) as *const OptionalHeader32);
+                let opt: OptionalHeader32 =
+                    std::ptr::read_unaligned(base.add(opt_header_start) as *const OptionalHeader32);
                 (
                     opt.image_base as u64,
                     opt.section_alignment,
@@ -371,8 +379,10 @@ impl PeParser {
         let mut sections = Vec::with_capacity(number_of_sections as usize);
         for i in 0..number_of_sections as usize {
             let section_offset = section_header_start + i * std::mem::size_of::<SectionHeader>();
-            let section_header = &*(base.add(section_offset) as *const SectionHeader);
-            sections.push(SectionInfo::from(section_header));
+            // SAFETY: section_offset is within the PE image which is validated to be `size` bytes.
+            let section_header: SectionHeader =
+                std::ptr::read_unaligned(base.add(section_offset) as *const SectionHeader);
+            sections.push(SectionInfo::from(&section_header));
         }
 
         Ok(Self {
